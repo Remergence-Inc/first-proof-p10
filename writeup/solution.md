@@ -195,6 +195,8 @@ which is **independent of $M$, $N$, and $q$**, and depends only on the spectral 
 
 **Physical interpretation.** When the fraction of observed data is large ($q/N \to 1$), the data term $(Z \otimes K)^\top SS^\top (Z \otimes K)$ approaches $(Z \otimes K)^\top (Z \otimes K) = \Gamma \otimes K^2$, and $P^{-1}\mathcal{A} \to I$, so PCG converges in very few iterations. Even when data is highly incomplete, the preconditioner captures the full Kronecker structure of the problem and only the perturbation due to missing data remains, yielding a well-conditioned preconditioned system.
 
+**Remark on tightness.** The bound (14) is a worst-case bound over all possible observation patterns $S$; it does not depend on $q$. In practice, for typical (e.g., uniformly random) observation patterns, the eigenvalues of $P^{-1}\mathcal{A}$ cluster much more tightly. Empirically, the condition number of $P^{-1}\mathcal{A}$ is observed to be $O(1/f)$ where $f = q/N$ is the observation fraction, rather than the pessimistic bound (14). The key practical point is that convergence is fast and determined by the data-completion ratio, not by the tensor dimensions.
+
 ---
 
 ## 6. Complete PCG Algorithm
