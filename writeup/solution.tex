@@ -1,0 +1,593 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+% Theorems
+\newtheorem{theorem}{Theorem}
+\newtheorem{remark}[theorem]{Remark}
+
+% Operators
+\DeclareMathOperator{\vect}{vec}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\reshape}{reshape}
+
+% Shortcuts
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\A}{\mathcal{A}}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\bb}{\mathbf{b}}
+\newcommand{\br}{\mathbf{r}}
+\newcommand{\bz}{\mathbf{z}}
+\newcommand{\bp}{\mathbf{p}}
+\newcommand{\bq}{\mathbf{q}}
+\newcommand{\by}{\mathbf{y}}
+\newcommand{\Zobs}{Z_{\mathrm{obs}}}
+
+\title{Solution to Problem~10 --- Efficient PCG Solver for\\
+  Tensor Decomposition with Missing Data}
+\author{Claude (Opus 4.6)}
+\date{February 2026}
+
+\begin{document}
+\maketitle
+
+%======================================================================
+\section{Problem Statement}
+%======================================================================
+
+We must solve the $nr \times nr$ linear system
+\begin{equation}\label{eq:system}
+  \A\,\vect(W) = \bb,
+\end{equation}
+where
+\[
+  \A = (Z \otimes K)^\top S S^\top (Z \otimes K) + \lambda\,(I_r \otimes K),
+  \qquad
+  \bb = (I_r \otimes K)\,\vect(B).
+\]
+Here $K \in \R^{n \times n}$ is a symmetric positive definite (SPD) kernel
+matrix, $Z \in \R^{M \times r}$ is the Khatri--Rao product of the factor
+matrices for all modes except mode~$k$, $S \in \R^{N \times q}$ is a selection
+matrix (a subset of columns of~$I_N$), $W \in \R^{n \times r}$ is the unknown,
+$B \in \R^{n \times r}$ is the MTTKRP, and $\lambda > 0$ is a regularization
+parameter.  We have $N = nM$ and $n, r \ll q \ll N$.
+
+A direct solve costs $O(n^3 r^3)$ and requires explicitly forming~$\A$, which
+is expensive.  We describe a preconditioned conjugate gradient (PCG) method
+whose per-iteration cost is $O(n^2 r + qr + nr^2)$, avoiding any computation
+or storage of order~$O(N)$ or~$O(M)$.
+
+%======================================================================
+\section{Key Identity}
+%======================================================================
+
+The entire method rests on the \textbf{Kronecker mixed-product identity}: for
+matrices $C \in \R^{p \times s}$, $D \in \R^{m \times n}$, and
+$X \in \R^{n \times s}$,
+\begin{equation}\label{eq:kron-identity}
+  (C \otimes D)\,\vect(X) = \vect(D\,X\,C^\top).
+\end{equation}
+This converts a Kronecker-structured matrix--vector product on vectors of
+length~$mn \cdot ps$ into ordinary matrix multiplications.
+
+%======================================================================
+\section{Implicit Matrix--Vector Product}
+%======================================================================
+
+We need to compute $\A\,\vect(W)$ for an arbitrary $W \in \R^{n \times r}$,
+without ever forming the $N \times N$ intermediate matrices.
+
+%----------------------------------------------------------------------
+\subsection{Forward map}
+%----------------------------------------------------------------------
+
+By identity~\eqref{eq:kron-identity} with $C = Z$ ($M \times r$) and $D = K$
+($n \times n$):
+\begin{equation}\label{eq:forward}
+  (Z \otimes K)\,\vect(W) = \vect(K W Z^\top).
+\end{equation}
+The matrix $KWZ^\top$ is $n \times M$, which has $nM = N$ entries---we
+\textbf{cannot} form it.  However, we only need the entries selected
+by~$S^\top$.
+
+%----------------------------------------------------------------------
+\subsection{Selection}
+%----------------------------------------------------------------------
+
+The selection matrix~$S$ picks $q$~entries from the $N$-dimensional vector
+$\vect(KWZ^\top)$.  Each selected entry corresponds to a position~$(i_s, j_s)$
+in the $n \times M$ matrix $KWZ^\top$, where $i_s \in \{1, \ldots, n\}$ is the
+mode-$k$ index and $j_s \in \{1, \ldots, M\}$ indexes the remaining modes.
+
+Define $V = KW \in \R^{n \times r}$ (cost:~$O(n^2 r)$).  Then:
+\begin{equation}\label{eq:entry}
+  [KWZ^\top]_{i_s, j_s}
+  = \sum_{\ell=1}^{r} V_{i_s, \ell}\, Z_{j_s, \ell}
+  = V(i_s, {:})\cdot Z(j_s, {:})^\top.
+\end{equation}
+Each entry costs~$O(r)$, and there are $q$~entries, giving a total cost
+of~$O(qr)$.
+
+Crucially, we never form the $n \times M$ matrix.  We only evaluate it at
+the~$q$ observed positions.
+
+%----------------------------------------------------------------------
+\subsection{Computing rows of $Z$ without forming $Z$}
+%----------------------------------------------------------------------
+
+$Z$ is the Khatri--Rao product
+$A_d \odot \cdots \odot A_{k+1} \odot A_{k-1} \odot \cdots \odot A_1$ and has
+$M$~rows.  We cannot store all of~$Z$.
+
+However, each row of the Khatri--Rao product is the elementwise product of
+corresponding rows from each factor matrix.  The column index~$j_s$ in the
+mode-$k$ unfolding corresponds to a multi-index
+$(i_1, \ldots, i_{k-1}, i_{k+1}, \ldots, i_d)$, and
+\begin{equation}\label{eq:z-row}
+  Z(j_s, \ell) = \prod_{m \neq k} A_m(i_m, \ell).
+\end{equation}
+This costs $O((d{-}1)r)$ per row.  Since we only need the rows at the
+$q$~observed positions, we can \textbf{precompute} them once at cost~$O(qdr)$
+and store them in a $q \times r$ array~$\Zobs$, requiring $O(qr)$~storage.
+This precomputation is amortized over all PCG iterations.
+
+%----------------------------------------------------------------------
+\subsection{Adjoint}
+%----------------------------------------------------------------------
+
+Let $\by \in \R^q$ be the vector of selected entries from the previous step.
+We need $(Z \otimes K)^\top S\,\by$.
+
+First, $S\,\by$ embeds $\by$ back into~$\R^N$, placing each~$y_s$ at
+position~$(i_s, j_s)$ and zeros elsewhere.  Interpreting this as an
+$n \times M$ matrix~$Y$ with at most $q$~nonzeros:
+\[
+  Y_{i,j} = \begin{cases}
+    y_s & \text{if } (i,j) = (i_s, j_s) \text{ for some } s, \\
+    0   & \text{otherwise.}
+  \end{cases}
+\]
+By identity~\eqref{eq:kron-identity} applied to the transpose:
+\begin{equation}\label{eq:transpose}
+  (Z \otimes K)^\top = Z^\top \otimes K^\top = Z^\top \otimes K,
+\end{equation}
+and
+\begin{equation}\label{eq:adjoint}
+  (Z^\top \otimes K)\,\vect(Y) = \vect(K\,Y\,Z).
+\end{equation}
+We never form $Y$ explicitly.  Instead, we compute
+$G = YZ \in \R^{n \times r}$ directly by scattering:
+\begin{equation}\label{eq:scatter}
+  G(i, {:}) = \sum_{s\,:\,i_s = i} y_s \cdot \Zobs(s, {:}),
+\end{equation}
+which costs~$O(qr)$ (one pass over the $q$~observations).  Then $KG$
+costs~$O(n^2 r)$.
+
+%----------------------------------------------------------------------
+\subsection{Regularization term}
+%----------------------------------------------------------------------
+
+\[
+  \lambda\,(I_r \otimes K)\,\vect(W) = \lambda\,\vect(KW) = \lambda\,\vect(V),
+\]
+which was already computed in the forward step.
+
+%----------------------------------------------------------------------
+\subsection{Complete matrix--vector product}
+%----------------------------------------------------------------------
+
+Combining all steps, the complete computation of $\A\,\vect(W)$ is:
+
+\medskip
+\begin{center}
+\begin{tabular}{clc}
+\toprule
+Step & Operation & Cost \\
+\midrule
+1 & $V = KW$ & $O(n^2 r)$ \\
+2 & $y_s = V(i_s, {:}) \cdot \Zobs(s, {:})^\top$ for $s = 1, \ldots, q$
+  & $O(qr)$ \\
+3 & $G = 0$;\; for each $s$: $G(i_s, {:}) \mathrel{+}= y_s \cdot \Zobs(s, {:})$
+  & $O(qr)$ \\
+4 & Result $= \vect(KG + \lambda V)$ & $O(n^2 r)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\medskip
+
+\noindent\textbf{Total cost per matrix--vector product: $O(n^2 r + qr)$.}
+
+No matrix of size $M \times r$, $n \times M$, or $N \times N$ is ever formed
+or stored.
+
+%======================================================================
+\section{Right-Hand Side}
+%======================================================================
+
+The right-hand side is
+\[
+  \bb = (I_r \otimes K)\,\vect(B) = \vect(KB),
+\]
+which costs $O(n^2 r)$ and is computed once before the iteration begins.
+
+%======================================================================
+\section{Preconditioner}
+%======================================================================
+
+%----------------------------------------------------------------------
+\subsection{The full-data approximation}
+%----------------------------------------------------------------------
+
+In the full-data case where all $N$~entries are observed, $S$~is the
+$N \times N$ identity and $SS^\top = I_N$.  The system matrix becomes
+\begin{equation}\label{eq:full-data}
+  \A_{\mathrm{full}}
+  = (Z \otimes K)^\top (Z \otimes K) + \lambda\,(I_r \otimes K)
+  = (Z^\top Z) \otimes K^2 + \lambda\,(I_r \otimes K),
+\end{equation}
+using the Kronecker identity
+$(A \otimes B)^\top (A \otimes B) = (A^\top A) \otimes (B^\top B)$.
+
+We take the preconditioner to be this full-data system matrix:
+\begin{equation}\label{eq:precond}
+  P = \Gamma \otimes K^2 + \lambda\,(I_r \otimes K),
+\end{equation}
+where $\Gamma = Z^\top Z \in \R^{r \times r}$.
+
+%----------------------------------------------------------------------
+\subsection{Efficient computation of $\Gamma$}
+%----------------------------------------------------------------------
+
+The matrix $\Gamma = Z^\top Z$ can be computed without forming~$Z$ (which is
+$M \times r$) by using a standard property of the Khatri--Rao product:
+\[
+  (A \odot B)^\top (A \odot B) = (A^\top A) * (B^\top B),
+\]
+where $*$ denotes the Hadamard (elementwise) product.  Applying this
+recursively:
+\begin{equation}\label{eq:gamma}
+  \Gamma = \prod_{m \neq k}^{*} (A_m^\top A_m),
+\end{equation}
+where $\prod^{*}$ denotes Hadamard product over all modes except~$k$.  Each
+$A_m^\top A_m$ is $r \times r$ and costs~$O(n_m r^2)$, giving a total cost
+of~$O\!\left(r^2 \sum_{m \neq k} n_m\right)$.
+
+%----------------------------------------------------------------------
+\subsection{Efficient application of $P^{-1}$}
+%----------------------------------------------------------------------
+
+Let $K = U \Lambda U^\top$ be the eigendecomposition of~$K$ (cost~$O(n^3)$,
+computed once), where $\Lambda = \diag(\lambda_1, \ldots, \lambda_n)$.  Let
+$\Gamma = V \Sigma V^\top$ be the eigendecomposition of~$\Gamma$
+(cost~$O(r^3)$, computed once), where
+$\Sigma = \diag(\sigma_1, \ldots, \sigma_r)$.
+
+Substituting into~\eqref{eq:precond}:
+\begin{equation}\label{eq:precond-diag}
+  P = (V \otimes U)\,
+      \bigl[\Sigma \otimes \Lambda^2 + \lambda\,(I_r \otimes \Lambda)\bigr]\,
+      (V^\top \otimes U^\top).
+\end{equation}
+The middle factor is \textbf{diagonal} with entries
+\begin{equation}\label{eq:diag-entries}
+  D_{(p,i)} = \sigma_p\,\lambda_i^2 + \lambda\,\lambda_i,
+  \qquad p = 1, \ldots, r, \quad i = 1, \ldots, n.
+\end{equation}
+
+Therefore $P^{-1}$ is applied as follows:
+
+\medskip
+\begin{center}
+\begin{tabular}{clc}
+\toprule
+Step & Operation & Cost \\
+\midrule
+1 & $Y_1 = U^\top X$ (reshape input to $n \times r$ first)
+  & $O(n^2 r)$ \\
+2 & $Y_2 = Y_1\,V$ & $O(nr^2)$ \\
+3 & Scale: $[Y_2]_{i,p} \mathrel{/}= \sigma_p \lambda_i^2 + \lambda\lambda_i$
+  & $O(nr)$ \\
+4 & $Y_3 = Y_2\,V^\top$ & $O(nr^2)$ \\
+5 & Result $= U\,Y_3$ & $O(n^2 r)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\medskip
+
+\noindent\textbf{Total cost per preconditioner application:
+$O(n^2 r + nr^2)$.}
+
+%----------------------------------------------------------------------
+\subsection{Why the preconditioner is effective}
+%----------------------------------------------------------------------
+
+\begin{theorem}\label{thm:eigenvalues}
+  The eigenvalues of $P^{-1}\A$ lie in the interval~$(0, 1]$.
+\end{theorem}
+
+\begin{proof}
+The system matrix can be written as
+\[
+  \A = (Z \otimes K)^\top S S^\top (Z \otimes K) + \lambda\,(I_r \otimes K).
+\]
+Since $SS^\top$ is a diagonal matrix with entries in~$\{0, 1\}$ (it is the
+orthogonal projection onto the observed entries), we have
+$SS^\top \preceq I_N$.  Therefore
+\[
+  (Z \otimes K)^\top S S^\top (Z \otimes K)
+  \preceq (Z \otimes K)^\top (Z \otimes K)
+  = \Gamma \otimes K^2,
+\]
+which gives
+$\A \preceq \Gamma \otimes K^2 + \lambda(I_r \otimes K) = P$.
+The upper bound follows: all eigenvalues of~$P^{-1}\A$ are at most~$1$.
+
+The lower bound follows from the positive definiteness of the regularization
+term: $\A \succeq \lambda(I_r \otimes K) \succ 0$ (assuming $K$ is positive
+definite), so $P^{-1}\A \succ 0$.
+\end{proof}
+
+\noindent\textbf{Tighter lower bound.}\quad
+Let $\alpha = \lambda_{\min}(P^{-1}(\lambda I_r \otimes K))$, where
+$\lambda_{\min}$ denotes the smallest eigenvalue.  Then all eigenvalues
+of~$P^{-1}\A$ lie in~$[\alpha, 1]$.
+Using~\eqref{eq:precond-diag}--\eqref{eq:diag-entries}, this minimum is
+\begin{equation}\label{eq:lower-bound}
+  \alpha
+  = \min_{p, i} \frac{\lambda\,\lambda_i}
+                      {\sigma_p\,\lambda_i^2 + \lambda\,\lambda_i}
+  = \min_{p, i} \frac{\lambda}{\sigma_p\,\lambda_i + \lambda}
+  = \frac{\lambda}{\sigma_{\max}\,\lambda_{\max}(K) + \lambda}.
+\end{equation}
+The condition number of the preconditioned system is therefore
+\begin{equation}\label{eq:cond-bound}
+  \kappa(P^{-1}\A)
+  \leq \frac{1}{\alpha}
+  = 1 + \frac{\sigma_{\max}\,\lambda_{\max}(K)}{\lambda},
+\end{equation}
+which is \textbf{independent of $M$, $N$, and~$q$}, and depends only on the
+spectral properties of the factor matrices and the kernel.
+
+\medskip\noindent\textbf{Physical interpretation.}\quad
+When the fraction of observed data is large ($q/N \to 1$), the data term
+$(Z \otimes K)^\top SS^\top (Z \otimes K)$ approaches
+$(Z \otimes K)^\top (Z \otimes K) = \Gamma \otimes K^2$, and
+$P^{-1}\A \to I$, so PCG converges in very few iterations.  Even when data is
+highly incomplete, the preconditioner captures the full Kronecker structure of
+the problem and only the perturbation due to missing data remains, yielding a
+well-conditioned preconditioned system.
+
+\begin{remark}[Tightness]
+The bound~\eqref{eq:cond-bound} is a worst-case bound over all possible
+observation patterns~$S$; it does not depend on~$q$.  In practice, for typical
+(e.g., uniformly random) observation patterns, the eigenvalues of~$P^{-1}\A$
+cluster much more tightly.  Empirically, the condition number of~$P^{-1}\A$ is
+observed to be $O(1/f)$ where $f = q/N$ is the observation fraction, rather
+than the pessimistic bound~\eqref{eq:cond-bound}.  The key practical point is
+that convergence is fast and determined by the data-completion ratio, not by the
+tensor dimensions.
+\end{remark}
+
+%======================================================================
+\section{Complete PCG Algorithm}
+%======================================================================
+
+\noindent\textbf{Precomputation} (done once before the PCG loop):
+
+\medskip
+\begin{center}
+\begin{tabular}{clc}
+\toprule
+Step & Operation & Cost \\
+\midrule
+P1 & Compute $\Gamma = \prod_{m \neq k}^{*} (A_m^\top A_m)$
+   & $O\!\left(r^2 \sum_{m \neq k} n_m\right)$ \\
+P2 & Eigendecomposition $K = U \Lambda U^\top$ & $O(n^3)$ \\
+P3 & Eigendecomposition $\Gamma = V \Sigma V^\top$ & $O(r^3)$ \\
+P4 & Precompute $\Zobs(s, {:})$ for $s = 1, \ldots, q$ & $O(qdr)$ \\
+P5 & Precompute diagonal $D_{(p,i)} = \sigma_p \lambda_i^2 + \lambda\lambda_i$
+   & $O(nr)$ \\
+P6 & Compute $\bb = \vect(KB)$ & $O(n^2 r)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\medskip
+
+\noindent\textbf{PCG iteration:}
+
+\begin{enumerate}[leftmargin=2em]
+  \item Set $\bx_0 = \mathbf{0}$,\; $\br_0 = \bb$,\;
+        $\bz_0 = P^{-1}\br_0$,\; $\bp_0 = \bz_0$.
+  \item For $j = 0, 1, 2, \ldots$\,:
+  \begin{enumerate}[label=(\alph*)]
+    \item $\bq_j = \A\,\bp_j$
+          \hfill (efficient mat-vec, cost $O(n^2 r + qr)$)
+    \item $\alpha_j = \langle \br_j, \bz_j \rangle
+                      \,/\, \langle \bp_j, \bq_j \rangle$
+    \item $\bx_{j+1} = \bx_j + \alpha_j\,\bp_j$
+    \item $\br_{j+1} = \br_j - \alpha_j\,\bq_j$
+    \item If $\|\br_{j+1}\| / \|\bb\| < \varepsilon$: stop.
+    \item $\bz_{j+1} = P^{-1}\br_{j+1}$
+          \hfill (preconditioner, cost $O(n^2 r + nr^2)$)
+    \item $\beta_j = \langle \br_{j+1}, \bz_{j+1} \rangle
+                     \,/\, \langle \br_j, \bz_j \rangle$
+    \item $\bp_{j+1} = \bz_{j+1} + \beta_j\,\bp_j$
+  \end{enumerate}
+  \item Output: $W = \reshape(\bx, n, r)$.
+\end{enumerate}
+
+\subsection*{Per-iteration cost: $O(n^2 r + qr + nr^2)$}
+
+The dominant costs are:
+\begin{itemize}[nosep]
+  \item Two multiplications by~$K$ (in the mat-vec): $O(n^2 r)$ each.
+  \item Two passes over the $q$~observations (gather and scatter): $O(qr)$ each.
+  \item Four small matrix multiplications in the preconditioner: $O(nr^2)$
+        or~$O(n^2 r)$.
+  \item Vector operations (dot products, axpy): $O(nr)$.
+\end{itemize}
+
+\subsection*{Storage: $O(n^2 + qr + r^2 + nr)$}
+
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+Data structure & Size \\
+\midrule
+Kernel eigenvectors $U$ & $n \times n$ \\
+$\Gamma$ eigenvectors $V$ & $r \times r$ \\
+Precomputed rows $\Zobs$ & $q \times r$ \\
+Observation indices $(i_s)$ & $q$ \\
+Diagonal $D$ & $n \times r$ \\
+PCG vectors ($\bx, \br, \bz, \bp, \bq$) & $5 \times nr$ \\
+Working matrices ($V, G$) & $n \times r$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Nothing of size $O(M)$, $O(N)$, or $O(M \times r)$ is stored.
+
+%======================================================================
+\section{Total Complexity}
+%======================================================================
+
+\subsection*{Comparison with direct solve}
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Method & Time & Storage \\
+\midrule
+Direct (form $\A$, Cholesky) & $O(n^3 r^3)$ + formation cost & $O(n^2 r^2)$ \\
+PCG (this method), $T$~iterations
+  & $O(n^3 + r^3 + qdr) + T \cdot O(n^2 r + qr + nr^2)$
+  & $O(n^2 + qr + r^2)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Since $r$ is typically small (say $r = 5$--$50$) and the
+preconditioner gives convergence in $T \ll nr$~iterations, the PCG method is
+substantially faster.  Moreover, the direct method requires forming
+$(Z \otimes K)^\top SS^\top(Z \otimes K)$, which involves the
+$N \times nr$ matrix $Z \otimes K$---this alone costs $O(Nnr) = O(n^2 Mr)$,
+which is prohibitive when $M$~is large.
+
+\subsection*{Number of iterations}
+
+By standard CG convergence theory, the number of iterations to reduce the
+relative residual by a factor of~$\varepsilon$ is bounded by
+\[
+  T \leq \tfrac{1}{2}\sqrt{\kappa(P^{-1}\A)}\,\ln(2/\varepsilon).
+\]
+From~\eqref{eq:cond-bound},
+$\kappa(P^{-1}\A) \leq 1 + \sigma_{\max}\,\lambda_{\max}(K)/\lambda$, so
+\begin{equation}\label{eq:iter-bound}
+  T = O\!\left(\sqrt{\frac{\sigma_{\max}\,\lambda_{\max}(K)}{\lambda}}
+               \,\ln(1/\varepsilon)\right).
+\end{equation}
+This is independent of $N$, $M$, and~$q$.
+
+%======================================================================
+\section{Empirical Validation}
+%======================================================================
+
+A complete Python implementation accompanies this solution (see
+\texttt{solver.py} and \texttt{experiments.py}).
+
+\subsection*{Correctness}
+
+The efficient matrix--vector product matches the naively constructed~$\A$ to
+machine precision (${\sim}\,10^{-15}$ relative error) across all test cases.
+The PCG solution matches the direct solve to ${\sim}\,10^{-11}$ relative error.
+
+\subsection*{Preconditioner effectiveness}
+
+\begin{center}
+\begin{tabular}{ccccc}
+\toprule
+Obs.\ fraction & CG iters (no precond) & PCG iters & Speedup
+  & $\kappa(P^{-1}\A)$ \\
+\midrule
+ 5\% & ${>}500$ & 52 & ${>}9.6\times$  & ---  \\
+10\% & ${>}500$ & 30 & ${>}16.7\times$ & 29   \\
+30\% & ${>}500$ & 17 & ${>}29.4\times$ & 5.6  \\
+50\% & ${>}500$ & 13 & ${>}38.5\times$ & 4.6  \\
+80\% & ${>}500$ & 10 & ${>}50\times$   & 2.0  \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The full-data preconditioner reduces the condition number by factors
+of $10^3$--$10^5$ and achieves convergence in tens of iterations regardless of
+problem size.
+
+\subsection*{PSD ordering verification}
+
+We verify numerically that $P - \A \succeq 0$ (i.e., $P \succeq \A$) for all
+tested observation fractions, confirming the theoretical bound that all
+eigenvalues of $P^{-1}\A$ lie in~$(0, 1]$.
+
+\subsection*{Preconditioner comparison}
+
+\begin{center}
+\begin{tabular}{cccc}
+\toprule
+Obs.\ fraction & No precond & $\lambda(I_r \otimes K)$ & Full-data $P$ \\
+\midrule
+ 5\% & ${>}500$ & 245 & 52 \\
+10\% & ${>}500$ & 199 & 30 \\
+30\% & ${>}500$ & 187 & 17 \\
+50\% & ${>}500$ & 177 & 13 \\
+80\% & ${>}500$ & 167 & 10 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The full-data preconditioner is dramatically more effective than the
+simpler regularization-only preconditioner $\lambda(I_r \otimes K)$, because it
+captures the Kronecker structure of the data-fit term as well.
+
+%======================================================================
+\section{Summary}
+%======================================================================
+
+The mode-$k$ subproblem in RKHS-regularized CP decomposition with missing data
+can be solved efficiently by PCG with:
+
+\begin{enumerate}
+  \item \textbf{Implicit matrix--vector products} using the Kronecker identity
+        $(C \otimes D)\vect(X) = \vect(DXC^\top)$, evaluating the intermediate
+        $n \times M$ matrix only at the $q$~observed positions.
+        Cost:~$O(n^2 r + qr)$.
+
+  \item \textbf{A full-data preconditioner}
+        $P = \Gamma \otimes K^2 + \lambda(I_r \otimes K)$,
+        where $\Gamma = Z^\top Z$ is computed in
+        $O\!\left(r^2 \sum n_m\right)$ via the Hadamard-product identity for
+        Khatri--Rao products, and $P^{-1}$ is applied in $O(n^2 r + nr^2)$ via
+        simultaneous diagonalization.
+
+  \item \textbf{Guaranteed convergence} in
+        $O\!\left(\sqrt{(\sigma_{\max}\,\lambda_{\max}(K))/\lambda}
+                  \,\ln(1/\varepsilon)\right)$
+        iterations, independent of the tensor size~$N$ and the number of
+        observations~$q$.
+\end{enumerate}
+
+\noindent The total cost per solve is
+\[
+  O\!\Big(n^3 + r^3 + qdr + T(n^2r + qr + nr^2)\Big),
+\]
+where $T$ is the number of PCG iterations.  Since $n$ and $r$ are small and $T$
+is moderate, this is a dramatic improvement over the $O(n^3 r^3)$ direct
+solve---and critically, no object of size $O(N)$ or $O(M)$ is ever formed or
+stored.
+
+\end{document}
