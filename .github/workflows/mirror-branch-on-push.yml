@@ -1,0 +1,42 @@
+name: Mirror pushed branch to downstream
+
+on:
+  push:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Mirror branch to downstream
+        env:
+          DOWNSTREAM_TOKEN: ${{ secrets.SMITH_WRITE_TOKEN }}
+        run: |
+          DOWNSTREAM_ORG="Remergence-Smith"
+          UPSTREAM_ORG="Remergence-Inc"
+          REPO="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          DOWNSTREAM="https://x-access-token:${DOWNSTREAM_TOKEN}@github.com/${DOWNSTREAM_ORG}/${REPO}.git"
+
+          echo "Pushing $BRANCH..."
+          if git push "$DOWNSTREAM" "$GITHUB_REF" 2>&1; then
+            echo "  OK: $BRANCH pushed"
+          else
+            echo "  DIVERGED: $BRANCH has diverged on ${DOWNSTREAM_ORG}"
+
+            UPSTREAM_PREFIX="upstream-${BRANCH}"
+            EXISTING=$(git ls-remote --heads "$DOWNSTREAM" "refs/heads/${UPSTREAM_PREFIX}-*" | wc -l)
+            NEXT=$(printf "%02d" $(( EXISTING + 1 )))
+            TARGET="${UPSTREAM_PREFIX}-${NEXT}"
+
+            echo "  Pushing ${UPSTREAM_ORG} ${BRANCH} to ${DOWNSTREAM_ORG} as ${TARGET}"
+            if git push "$DOWNSTREAM" "$GITHUB_REF:refs/heads/$TARGET" 2>&1; then
+              echo "  OK: diverged content available on ${DOWNSTREAM_ORG} as ${TARGET}"
+            else
+              echo "  FAILED: could not push diverged branch as ${TARGET}"
+            fi
+          fi
